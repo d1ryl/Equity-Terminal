@@ -25,7 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 SEC_EMAIL = os.environ.get("SEC_EMAIL", "leedaryl2003@gmail.com")
 SEC_HEADERS = {"User-Agent": f"EquityTerminal/1.0 ({SEC_EMAIL})"}
 
-# Optional price fallback. Set ALPHAVANTAGE_KEY in the environment to enable.
+# Price sources (set whichever keys you have; the app tries them in order).
+TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY", "")
 ALPHAVANTAGE_KEY = os.environ.get("ALPHAVANTAGE_KEY", "")
 
 app = FastAPI(title="Equity Terminal — cloud backend", version="2.0")
@@ -42,6 +43,30 @@ def _t(code):
 
 
 # ----------------------------- prices -----------------------------
+def _twelvedata(ticker, count):
+    if not TWELVEDATA_KEY:
+        return []
+    url = ("https://api.twelvedata.com/time_series"
+           f"?symbol={ticker}&interval=1day&outputsize={count}&apikey={TWELVEDATA_KEY}")
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    vals = r.json().get("values")  # error responses have no "values"
+    if not vals:
+        return []
+    bars = []
+    for v in reversed(vals):  # API returns newest-first
+        try:
+            bars.append({
+                "date": v["datetime"][:10],
+                "open": float(v["open"]), "high": float(v["high"]),
+                "low": float(v["low"]), "close": float(v["close"]),
+                "volume": int(float(v.get("volume") or 0)),
+            })
+        except (ValueError, KeyError):
+            continue
+    return bars[-count:]
+
+
 def _stooq(ticker, count):
     url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
     r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
@@ -80,23 +105,26 @@ def _alphavantage(ticker, count):
     return bars[-count:]
 
 
+def _prices(ticker, count):
+    """Try sources in order: Twelve Data (key) -> Stooq (keyless) -> Alpha Vantage (key)."""
+    for fn in (_twelvedata, _stooq, _alphavantage):
+        try:
+            bars = fn(ticker, count)
+            if bars:
+                return bars
+        except Exception:
+            pass
+    return []
+
+
 @app.get("/api/candles")
 def candles(code: str = Query(..., description="e.g. US.NVDA or NVDA"),
             count: int = Query(120, ge=10, le=2000)):
     t = _t(code)
-    bars = []
-    try:
-        bars = _stooq(t, count)
-    except Exception:
-        bars = []
-    if not bars:
-        try:
-            bars = _alphavantage(t, count)
-        except Exception:
-            bars = []
+    bars = _prices(t, count)
     if not bars:
         raise HTTPException(404, f"No price data for {t}. US tickers only; "
-                                 "set ALPHAVANTAGE_KEY for a fallback source.")
+                                 "set TWELVEDATA_KEY (or ALPHAVANTAGE_KEY) in the backend env.")
     return {"ticker": t, "count": len(bars), "last": bars[-1]["close"], "bars": bars}
 
 
@@ -107,7 +135,7 @@ def snapshot(code: str = Query(..., description="e.g. US.NVDA")):
     t = _t(code)
     last_price = None
     try:
-        bars = _stooq(t, 1) or _alphavantage(t, 1)
+        bars = _prices(t, 1)
         if bars:
             last_price = bars[-1]["close"]
     except Exception:
@@ -226,9 +254,10 @@ def fundamentals(code: str = Query(..., description="e.g. US.NVDA"),
 
 @app.get("/api/health")
 def health():
-    return {"ok": True,
-            "prices": "stooq" + ("+alphavantage" if ALPHAVANTAGE_KEY else ""),
-            "fundamentals": "sec-edgar"}
+    sources = [s for s, on in [("twelvedata", TWELVEDATA_KEY),
+                               ("stooq", True),
+                               ("alphavantage", ALPHAVANTAGE_KEY)] if on]
+    return {"ok": True, "prices": "+".join(sources), "fundamentals": "sec-edgar"}
 
 
 @app.get("/")
