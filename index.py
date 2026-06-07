@@ -22,12 +22,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # SEC requires a descriptive User-Agent with a contact email or it 403s.
 # On Vercel, set SEC_EMAIL as an environment variable.
-SEC_EMAIL = os.environ.get("SEC_EMAIL", "leedaryl2003@gmail.com")
+SEC_EMAIL = os.environ.get("SEC_EMAIL", "leedaryl@gmail.com")
 SEC_HEADERS = {"User-Agent": f"EquityTerminal/1.0 ({SEC_EMAIL})"}
 
 # Price sources (set whichever keys you have; the app tries them in order).
 TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY", "")
 ALPHAVANTAGE_KEY = os.environ.get("ALPHAVANTAGE_KEY", "")
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")  # for the news endpoint
 
 app = FastAPI(title="Equity Terminal — cloud backend", version="2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -43,11 +44,11 @@ def _t(code):
 
 
 # ----------------------------- prices -----------------------------
-def _twelvedata(ticker, count):
+def _twelvedata(ticker, count, interval="1day"):
     if not TWELVEDATA_KEY:
         return []
     url = ("https://api.twelvedata.com/time_series"
-           f"?symbol={ticker}&interval=1day&outputsize={count}&apikey={TWELVEDATA_KEY}")
+           f"?symbol={ticker}&interval={interval}&outputsize={count}&apikey={TWELVEDATA_KEY}")
     r = requests.get(url, timeout=20)
     r.raise_for_status()
     vals = r.json().get("values")  # error responses have no "values"
@@ -57,7 +58,7 @@ def _twelvedata(ticker, count):
     for v in reversed(vals):  # API returns newest-first
         try:
             bars.append({
-                "date": v["datetime"][:10],
+                "date": v["datetime"],
                 "open": float(v["open"]), "high": float(v["high"]),
                 "low": float(v["low"]), "close": float(v["close"]),
                 "volume": int(float(v.get("volume") or 0)),
@@ -105,23 +106,31 @@ def _alphavantage(ticker, count):
     return bars[-count:]
 
 
-def _prices(ticker, count):
-    """Try sources in order: Twelve Data (key) -> Stooq (keyless) -> Alpha Vantage (key)."""
-    for fn in (_twelvedata, _stooq, _alphavantage):
-        try:
-            bars = fn(ticker, count)
-            if bars:
-                return bars
-        except Exception:
-            pass
+def _prices(ticker, count, period="1day"):
+    """Twelve Data handles any interval; Stooq/Alpha Vantage are daily-only fallbacks."""
+    try:
+        bars = _twelvedata(ticker, count, period)
+        if bars:
+            return bars
+    except Exception:
+        pass
+    if period == "1day":
+        for fn in (_stooq, _alphavantage):
+            try:
+                bars = fn(ticker, count)
+                if bars:
+                    return bars
+            except Exception:
+                pass
     return []
 
 
 @app.get("/api/candles")
 def candles(code: str = Query(..., description="e.g. US.NVDA or NVDA"),
-            count: int = Query(120, ge=10, le=2000)):
+            count: int = Query(120, ge=10, le=2000),
+            period: str = Query("1day", description="1h, 4h, 1day, 1week")):
     t = _t(code)
-    bars = _prices(t, count)
+    bars = _prices(t, count, period)
     if not bars:
         raise HTTPException(404, f"No price data for {t}. US tickers only; "
                                  "set TWELVEDATA_KEY (or ALPHAVANTAGE_KEY) in the backend env.")
@@ -160,6 +169,7 @@ CAPEX_TAGS = [
     "PaymentsToAcquirePropertyPlantAndEquipment",
     "PaymentsToAcquireProductiveAssets",
 ]
+SBC_TAGS = ["ShareBasedCompensation", "ShareBasedCompensationExpense"]
 
 
 def _cik_map():
@@ -226,19 +236,28 @@ def fundamentals(code: str = Query(..., description="e.g. US.NVDA"),
         raise HTTPException(404, f"No operating cash flow found for {t}.")
     capex = _annual_series(cik, CAPEX_TAGS, limit=years + 1)
     capex_by_end = {r["period_end"]: r["value"] for r in capex}
+    sbc = _annual_series(cik, SBC_TAGS, limit=years + 1)
+    sbc_by_end = {r["period_end"]: r["value"] for r in sbc}
 
     history = []
     for r in ocf:
         cap = capex_by_end.get(r["period_end"])
+        sb = sbc_by_end.get(r["period_end"])
+        fcf = r["value"] - (cap or 0.0)
         history.append({
             "fiscal_year": r["fiscal_year"],
             "period_end": r["period_end"],
             "operating_cash_flow": r["value"],
             "capex": cap,
-            "free_cash_flow": r["value"] - (cap or 0.0),
+            "sbc": sb,
+            "free_cash_flow": fcf,
+            # SBC is a real economic cost hidden in operating cash flow; subtract it
+            # for a more conservative FCF on share-heavy (tech) companies.
+            "fcf_ex_sbc": fcf - (sb or 0.0),
         })
     history = history[-years:]
     fcfs = [h["free_cash_flow"] for h in history]
+    fcfs_ex = [h["fcf_ex_sbc"] for h in history]
 
     return {
         "ticker": t,
@@ -246,10 +265,38 @@ def fundamentals(code: str = Query(..., description="e.g. US.NVDA"),
         "fiscal_year": history[-1]["fiscal_year"],
         "free_cash_flow": history[-1]["free_cash_flow"],
         "fcf_avg": sum(fcfs) / len(fcfs),
+        "fcf_ex_sbc_avg": sum(fcfs_ex) / len(fcfs_ex),
         "shares": _latest_shares(cik),
         "history": history,
         "source": "SEC EDGAR (10-K)",
     }
+
+
+@app.get("/api/news")
+def news(code: str = Query(..., description="e.g. US.NVDA"),
+         limit: int = Query(12, ge=1, le=50)):
+    """Recent company news from Finnhub (needs FINNHUB_KEY)."""
+    if not FINNHUB_KEY:
+        raise HTTPException(400, "Set FINNHUB_KEY in the backend env to enable news.")
+    t = _t(code)
+    today = dt.date.today()
+    frm = today - dt.timedelta(days=21)
+    url = (f"https://finnhub.io/api/v1/company-news?symbol={t}"
+           f"&from={frm.isoformat()}&to={today.isoformat()}&token={FINNHUB_KEY}")
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    items = r.json()
+    if not isinstance(items, list):
+        return {"ticker": t, "news": []}
+    out = [{
+        "headline": x.get("headline"),
+        "summary": x.get("summary"),
+        "source": x.get("source"),
+        "url": x.get("url"),
+        "datetime": x.get("datetime"),  # unix seconds
+        "image": x.get("image"),
+    } for x in items[:limit]]
+    return {"ticker": t, "news": out}
 
 
 @app.get("/api/health")
@@ -257,10 +304,13 @@ def health():
     sources = [s for s, on in [("twelvedata", TWELVEDATA_KEY),
                                ("stooq", True),
                                ("alphavantage", ALPHAVANTAGE_KEY)] if on]
-    return {"ok": True, "prices": "+".join(sources), "fundamentals": "sec-edgar"}
+    return {"ok": True, "prices": "+".join(sources),
+            "fundamentals": "sec-edgar",
+            "news": "finnhub" if FINNHUB_KEY else "off"}
 
 
 @app.get("/")
 def root():
     return {"service": "equity-terminal-cloud",
-            "endpoints": ["/api/health", "/api/candles", "/api/fundamentals"]}
+            "endpoints": ["/api/health", "/api/candles", "/api/snapshot",
+                          "/api/fundamentals", "/api/news"]}
