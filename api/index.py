@@ -387,6 +387,7 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
     t = _t(code)
     recommendation = None
     price_target = None
+    analyst_estimates = None
     notes = []
 
     if FINNHUB_KEY:
@@ -429,8 +430,14 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
     # --- yfinance price targets (free, no key, primary source) ---
     if YFINANCE_OK and not price_target:
         try:
-            yft = yf.Ticker(t)
-            apt = yft.analyst_price_targets
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+                _fut = _pool.submit(lambda: yf.Ticker(t).analyst_price_targets)
+                try:
+                    apt = _fut.result(timeout=8)
+                except _cf.TimeoutError:
+                    apt = {}
+                    notes.append("yfinance price targets timed out")
             # yfinance returns values as Yahoo raw dicts {"raw": 185.5, "fmt": "185.50"}
             # or plain floats depending on version — handle both
             def _extract(v):
@@ -465,10 +472,19 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
     # --- yfinance analyst earnings estimates (free) ---
     if YFINANCE_OK and not analyst_estimates:
         try:
-            yft2 = yf.Ticker(t)
+            import concurrent.futures as _cf2
+            def _get_estimates():
+                _t2 = yf.Ticker(t)
+                return _t2.earnings_estimate, _t2.revenue_estimate
+            with _cf2.ThreadPoolExecutor(max_workers=1) as _pool2:
+                _fut2 = _pool2.submit(_get_estimates)
+                try:
+                    eps_est, rev_est = _fut2.result(timeout=8)
+                except _cf2.TimeoutError:
+                    eps_est, rev_est = None, None
             try:
-                eps_est = yft2.earnings_estimate
-                rev_est = yft2.revenue_estimate
+                eps_est = eps_est
+                rev_est = rev_est
                 if eps_est is not None and not eps_est.empty:
                     row_eps = eps_est.to_dict(orient="index").get("0y") or eps_est.to_dict(orient="index").get(list(eps_est.index)[0], {})
                     row_rev = rev_est.to_dict(orient="index").get("0y") if rev_est is not None and not rev_est.empty else {}
@@ -534,7 +550,6 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
                 pass
 
         # 3. Try v3/analyst-estimates for EPS/revenue consensus (free tier)
-        analyst_estimates = None
         try:
             url = (f"https://financialmodelingprep.com/api/v3/analyst-estimates"
                    f"?symbol={t}&limit=2&apikey={FMP_API_KEY}")
