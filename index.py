@@ -423,22 +423,54 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
 
     if FMP_API_KEY:
         try:
-            url = (f"https://financialmodelingprep.com/api/v3/price-target-consensus"
+            # v4/price-target returns individual analyst targets (free tier)
+            # We compute mean/median/high/low ourselves
+            url = (f"https://financialmodelingprep.com/api/v4/price-target"
                    f"?symbol={t}&apikey={FMP_API_KEY}")
             r = requests.get(url, timeout=20)
             r.raise_for_status()
             j = r.json()
-            row = j[0] if isinstance(j, list) and j else (j if isinstance(j, dict) else None)
-            if row:
+            targets = []
+            if isinstance(j, list):
+                # Take the most recent 30 analyst targets
+                for item in j[:30]:
+                    pt_val = item.get("priceTarget") or item.get("adjPriceTarget")
+                    if pt_val and float(pt_val) > 0:
+                        targets.append(float(pt_val))
+            if targets:
+                targets_sorted = sorted(targets)
+                n_t = len(targets_sorted)
+                median_t = targets_sorted[n_t // 2] if n_t % 2 else (targets_sorted[n_t//2-1] + targets_sorted[n_t//2]) / 2
                 price_target = {
-                    "high": row.get("targetHigh"),
-                    "low": row.get("targetLow"),
-                    "mean": row.get("targetConsensus"),
-                    "median": row.get("targetMedian"),
+                    "high": max(targets_sorted),
+                    "low": min(targets_sorted),
+                    "mean": round(sum(targets_sorted) / n_t, 2),
+                    "median": round(median_t, 2),
+                    "count": n_t,
                     "source": "fmp",
                 }
-        except Exception:
-            notes.append("FMP price-target fetch failed (check FMP_API_KEY / plan).")
+            else:
+                # Fallback: try v3 consensus endpoint
+                url2 = (f"https://financialmodelingprep.com/api/v3/price-target-consensus"
+                        f"?symbol={t}&apikey={FMP_API_KEY}")
+                r2 = requests.get(url2, timeout=20)
+                if r2.status_code == 200:
+                    j2 = r2.json()
+                    row = j2[0] if isinstance(j2, list) and j2 else (j2 if isinstance(j2, dict) else None)
+                    if row and row.get("targetConsensus"):
+                        price_target = {
+                            "high": row.get("targetHigh"),
+                            "low": row.get("targetLow"),
+                            "mean": row.get("targetConsensus"),
+                            "median": row.get("targetMedian"),
+                            "source": "fmp-consensus",
+                        }
+                    else:
+                        notes.append("FMP returned no price targets for this ticker.")
+                else:
+                    notes.append("FMP price targets unavailable. Check FMP_API_KEY is active.")
+        except Exception as e:
+            notes.append(f"FMP price-target fetch failed: {str(e)[:80]}")
     elif FINNHUB_KEY:
         try:
             url = f"https://finnhub.io/api/v1/stock/price-target?symbol={t}&token={FINNHUB_KEY}"
