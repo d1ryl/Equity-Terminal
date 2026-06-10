@@ -431,18 +431,31 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
         try:
             yft = yf.Ticker(t)
             apt = yft.analyst_price_targets
-            # apt is a dict: {current, low, mean, high, median (sometimes)}
-            if apt and apt.get("mean") and float(apt["mean"]) > 0:
-                price_target = {
-                    "high":   round(float(apt.get("high",  0)), 2) or None,
-                    "low":    round(float(apt.get("low",   0)), 2) or None,
-                    "mean":   round(float(apt.get("mean",  0)), 2),
-                    "median": round(float(apt.get("median", apt.get("mean", 0))), 2),
-                    "current": round(float(apt.get("current", 0)), 2) or None,
-                    "source": "yahoo",
-                }
+            # apt may be a dict or a pandas Series depending on yfinance version
+            if apt is not None:
+                # Normalise to plain dict
+                if hasattr(apt, 'to_dict'):
+                    apt = apt.to_dict()
+                if isinstance(apt, dict):
+                    mean_val = apt.get("mean") or apt.get("Mean") or apt.get("targetMeanPrice")
+                    if mean_val and float(mean_val) > 0:
+                        def _f(k, *aliases):
+                            for key in (k,) + aliases:
+                                v = apt.get(key)
+                                if v is not None:
+                                    try: return round(float(v), 2)
+                                    except: pass
+                            return None
+                        price_target = {
+                            "high":    _f("high", "High", "targetHighPrice"),
+                            "low":     _f("low",  "Low",  "targetLowPrice"),
+                            "mean":    _f("mean", "Mean", "targetMeanPrice"),
+                            "median":  _f("median", "Median", "targetMedianPrice") or _f("mean"),
+                            "current": _f("current", "Current", "currentPrice"),
+                            "source":  "yahoo",
+                        }
         except Exception as e:
-            notes.append(f"yfinance price target fetch failed: {str(e)[:60]}")
+            notes.append(f"yfinance price targets unavailable: {str(e)[:80]}")
 
     # --- yfinance analyst earnings estimates (free) ---
     if YFINANCE_OK and not analyst_estimates:
@@ -604,7 +617,8 @@ def health():
             "fundamentals": "sec-edgar",
             "news": "finnhub" if FINNHUB_KEY else "off",
             "analyst": ("finnhub-recs" + ("+fmp-targets" if FMP_API_KEY else "")) if FINNHUB_KEY else ("fmp-targets" if FMP_API_KEY else "off"),
-            "benchmark": "spy-via-price-stack"}
+            "benchmark": "spy-via-price-stack",
+            "yfinance": "ok" if YFINANCE_OK else "not-installed (add yfinance to requirements.txt)"}
 
 
 @app.get("/")
