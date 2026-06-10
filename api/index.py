@@ -19,6 +19,7 @@ import io
 import os
 import datetime as dt
 
+import concurrent.futures
 import requests
 try:
     import yfinance as yf
@@ -430,12 +431,11 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
     # --- yfinance price targets (free, no key, primary source) ---
     if YFINANCE_OK and not price_target:
         try:
-            import concurrent.futures as _cf
-            with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
                 _fut = _pool.submit(lambda: yf.Ticker(t).analyst_price_targets)
                 try:
                     apt = _fut.result(timeout=8)
-                except _cf.TimeoutError:
+                except concurrent.futures.TimeoutError:
                     apt = {}
                     notes.append("yfinance price targets timed out")
             # yfinance returns values as Yahoo raw dicts {"raw": 185.5, "fmt": "185.50"}
@@ -472,15 +472,14 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
     # --- yfinance analyst earnings estimates (free) ---
     if YFINANCE_OK and not analyst_estimates:
         try:
-            import concurrent.futures as _cf2
             def _get_estimates():
                 _t2 = yf.Ticker(t)
                 return _t2.earnings_estimate, _t2.revenue_estimate
-            with _cf2.ThreadPoolExecutor(max_workers=1) as _pool2:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool2:
                 _fut2 = _pool2.submit(_get_estimates)
                 try:
                     eps_est, rev_est = _fut2.result(timeout=8)
-                except _cf2.TimeoutError:
+                except concurrent.futures.TimeoutError:
                     eps_est, rev_est = None, None
             try:
                 eps_est = eps_est
