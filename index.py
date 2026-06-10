@@ -4,8 +4,11 @@ Equity Terminal — cloud backend (no gateway, deploy anywhere)
 Pure hosted web APIs, so this runs as a Vercel serverless function with no
 moomoo OpenD and no always-on computer.
 
-  Prices ......... Stooq daily CSV (keyless) + optional Alpha Vantage fallback
+  Prices ......... Twelve Data (primary) -> Stooq daily CSV (keyless) -> Alpha Vantage fallback
   Fundamentals ... SEC EDGAR (keyless, official)
+  News ........... Finnhub (needs FINNHUB_KEY)
+  Analyst ........ Finnhub recs (free) + FMP price targets (needs FMP_API_KEY)
+  Benchmark ...... SPY via same price stack (for relative strength)
 
 Run locally:   uvicorn api.index:app --reload --port 8000
 Deploy:        push to GitHub -> import on vercel.com (see README.md)
@@ -21,17 +24,15 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 # SEC requires a descriptive User-Agent with a contact email or it 403s.
-# On Vercel, set SEC_EMAIL as an environment variable.
 SEC_EMAIL = os.environ.get("SEC_EMAIL", "leedaryl@gmail.com")
 SEC_HEADERS = {"User-Agent": f"EquityTerminal/1.0 ({SEC_EMAIL})"}
 
-# Price sources (set whichever keys you have; the app tries them in order).
-TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY", "")
+TWELVEDATA_KEY  = os.environ.get("TWELVEDATA_KEY", "")
 ALPHAVANTAGE_KEY = os.environ.get("ALPHAVANTAGE_KEY", "")
-FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")  # for the news endpoint
-FMP_API_KEY = os.environ.get("FMP_API_KEY", "")    # optional: analyst price targets (financialmodelingprep.com)
+FINNHUB_KEY     = os.environ.get("FINNHUB_KEY", "")
+FMP_API_KEY     = os.environ.get("FMP_API_KEY", "")
 
-app = FastAPI(title="Equity Terminal — cloud backend", version="2.0")
+app = FastAPI(title="Equity Terminal — cloud backend", version="2.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -52,11 +53,11 @@ def _twelvedata(ticker, count, interval="1day"):
            f"?symbol={ticker}&interval={interval}&outputsize={count}&apikey={TWELVEDATA_KEY}")
     r = requests.get(url, timeout=20)
     r.raise_for_status()
-    vals = r.json().get("values")  # error responses have no "values"
+    vals = r.json().get("values")
     if not vals:
         return []
     bars = []
-    for v in reversed(vals):  # API returns newest-first
+    for v in reversed(vals):
         try:
             bars.append({
                 "date": v["datetime"],
@@ -108,7 +109,6 @@ def _alphavantage(ticker, count):
 
 
 def _prices(ticker, count, period="1day"):
-    """Twelve Data handles any interval; Stooq/Alpha Vantage are daily-only fallbacks."""
     try:
         bars = _twelvedata(ticker, count, period)
         if bars:
@@ -138,10 +138,19 @@ def candles(code: str = Query(..., description="e.g. US.NVDA or NVDA"),
     return {"ticker": t, "count": len(bars), "last": bars[-1]["close"], "bars": bars}
 
 
+@app.get("/api/benchmark")
+def benchmark(count: int = Query(120, ge=10, le=2000),
+              period: str = Query("1day", description="1h, 4h, 1day, 1week")):
+    """SPY closes for relative-strength calculation on the frontend."""
+    bars = _prices("SPY", count, period)
+    if not bars:
+        # Return empty rather than 404 — RS scoring degrades gracefully
+        return {"ticker": "SPY", "count": 0, "bars": []}
+    return {"ticker": "SPY", "count": len(bars), "bars": bars}
+
+
 @app.get("/api/snapshot")
 def snapshot(code: str = Query(..., description="e.g. US.NVDA")):
-    """Last price (Stooq) + shares outstanding (SEC EDGAR) — mirrors the
-    moomoo backend so the same frontend works against either."""
     t = _t(code)
     last_price = None
     try:
@@ -150,14 +159,28 @@ def snapshot(code: str = Query(..., description="e.g. US.NVDA")):
             last_price = bars[-1]["close"]
     except Exception:
         pass
+
     shares = None
+    beta = None
     try:
         cik = _cik_map().get(t)
         if cik:
             shares = _latest_shares(cik)
     except Exception:
         pass
-    return {"code": t, "last_price": last_price, "issued_shares": shares}
+
+    # Beta from Finnhub (free tier)
+    if FINNHUB_KEY:
+        try:
+            r = requests.get(
+                f"https://finnhub.io/api/v1/stock/metric?symbol={t}&metric=all&token={FINNHUB_KEY}",
+                timeout=10)
+            if r.status_code == 200:
+                beta = r.json().get("metric", {}).get("beta")
+        except Exception:
+            pass
+
+    return {"code": t, "last_price": last_price, "issued_shares": shares, "beta": beta}
 
 
 # -------------------------- fundamentals (SEC EDGAR) --------------------------
@@ -171,6 +194,22 @@ CAPEX_TAGS = [
     "PaymentsToAcquireProductiveAssets",
 ]
 SBC_TAGS = ["ShareBasedCompensation", "ShareBasedCompensationExpense"]
+
+# Balance sheet tags for net debt auto-fill
+CASH_TAGS = [
+    "CashAndCashEquivalentsAtCarryingValue",
+    "CashCashEquivalentsAndShortTermInvestments",
+]
+DEBT_TAGS = [
+    "LongTermDebt",
+    "LongTermDebtNoncurrent",
+    "SeniorNotes",
+]
+DEBT_CURRENT_TAGS = [
+    "LongTermDebtCurrent",
+    "CurrentPortionOfLongTermDebt",
+    "NotesPayableCurrent",
+]
 
 
 def _cik_map():
@@ -207,6 +246,31 @@ def _annual_series(cik, tags, limit=4):
         if rows:
             return [rows[k] for k in sorted(rows.keys())][-limit:]
     return []
+
+
+def _latest_value(cik, tags):
+    """Return the most recent annual (10-K) value for the first matching tag."""
+    for tag in tags:
+        url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/us-gaap/{tag}.json"
+        resp = requests.get(url, headers=SEC_HEADERS, timeout=15)
+        if resp.status_code != 200:
+            continue
+        units = resp.json().get("units", {}).get("USD", [])
+        annual = [u for u in units if u.get("form") == "10-K" and u.get("end")]
+        if annual:
+            latest = max(annual, key=lambda u: u["end"])
+            return float(latest["val"])
+    return None
+
+
+def _net_debt(cik):
+    """cash_and_equiv - total_debt (long-term + current). Negative = net cash."""
+    cash = _latest_value(cik, CASH_TAGS)
+    debt_lt = _latest_value(cik, DEBT_TAGS) or 0.0
+    debt_cur = _latest_value(cik, DEBT_CURRENT_TAGS) or 0.0
+    if cash is None:
+        return None
+    return (debt_lt + debt_cur) - cash   # positive = net debt, negative = net cash
 
 
 def _latest_shares(cik):
@@ -252,13 +316,18 @@ def fundamentals(code: str = Query(..., description="e.g. US.NVDA"),
             "capex": cap,
             "sbc": sb,
             "free_cash_flow": fcf,
-            # SBC is a real economic cost hidden in operating cash flow; subtract it
-            # for a more conservative FCF on share-heavy (tech) companies.
             "fcf_ex_sbc": fcf - (sb or 0.0),
         })
     history = history[-years:]
     fcfs = [h["free_cash_flow"] for h in history]
     fcfs_ex = [h["fcf_ex_sbc"] for h in history]
+
+    # Net debt for DCF auto-fill (best-effort)
+    net_debt = None
+    try:
+        net_debt = _net_debt(cik)
+    except Exception:
+        pass
 
     return {
         "ticker": t,
@@ -268,6 +337,7 @@ def fundamentals(code: str = Query(..., description="e.g. US.NVDA"),
         "fcf_avg": sum(fcfs) / len(fcfs),
         "fcf_ex_sbc_avg": sum(fcfs_ex) / len(fcfs_ex),
         "shares": _latest_shares(cik),
+        "net_debt": net_debt,       # negative = net cash position
         "history": history,
         "source": "SEC EDGAR (10-K)",
     }
@@ -276,7 +346,6 @@ def fundamentals(code: str = Query(..., description="e.g. US.NVDA"),
 @app.get("/api/news")
 def news(code: str = Query(..., description="e.g. US.NVDA"),
          limit: int = Query(12, ge=1, le=50)):
-    """Recent company news from Finnhub (needs FINNHUB_KEY)."""
     if not FINNHUB_KEY:
         raise HTTPException(400, "Set FINNHUB_KEY in the backend env to enable news.")
     t = _t(code)
@@ -294,7 +363,7 @@ def news(code: str = Query(..., description="e.g. US.NVDA"),
         "summary": x.get("summary"),
         "source": x.get("source"),
         "url": x.get("url"),
-        "datetime": x.get("datetime"),  # unix seconds
+        "datetime": x.get("datetime"),
         "image": x.get("image"),
     } for x in items[:limit]]
     return {"ticker": t, "news": out}
@@ -302,15 +371,11 @@ def news(code: str = Query(..., description="e.g. US.NVDA"),
 
 @app.get("/api/analyst")
 def analyst(code: str = Query(..., description="e.g. US.NVDA")):
-    """Analyst views: recommendation trends (Finnhub, free) + price targets.
-    Price targets need FMP_API_KEY (financialmodelingprep.com) or a Finnhub plan
-    that includes /stock/price-target. Degrades gracefully when unavailable."""
     t = _t(code)
     recommendation = None
     price_target = None
     notes = []
 
-    # --- recommendation trends (Finnhub free) ---
     if FINNHUB_KEY:
         try:
             url = f"https://finnhub.io/api/v1/stock/recommendation?symbol={t}&token={FINNHUB_KEY}"
@@ -318,7 +383,7 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
             r.raise_for_status()
             rows = r.json()
             if isinstance(rows, list) and rows:
-                x = rows[0]  # most recent period
+                x = rows[0]
                 sb = int(x.get("strongBuy", 0) or 0)
                 b = int(x.get("buy", 0) or 0)
                 h = int(x.get("hold", 0) or 0)
@@ -343,12 +408,11 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
                     "strongBuy": sb, "buy": b, "hold": h, "sell": se, "strongSell": ss,
                     "total": total, "consensus": consensus,
                 }
-        except Exception as e:
+        except Exception:
             notes.append("recommendation fetch failed")
     else:
         notes.append("Set FINNHUB_KEY for analyst rating consensus.")
 
-    # --- price target consensus ---
     if FMP_API_KEY:
         try:
             url = (f"https://financialmodelingprep.com/api/v3/price-target-consensus"
@@ -403,11 +467,13 @@ def health():
     return {"ok": True, "prices": "+".join(sources),
             "fundamentals": "sec-edgar",
             "news": "finnhub" if FINNHUB_KEY else "off",
-            "analyst": ("finnhub-recs" + ("+fmp-targets" if FMP_API_KEY else "")) if FINNHUB_KEY else ("fmp-targets" if FMP_API_KEY else "off")}
+            "analyst": ("finnhub-recs" + ("+fmp-targets" if FMP_API_KEY else "")) if FINNHUB_KEY else ("fmp-targets" if FMP_API_KEY else "off"),
+            "benchmark": "spy-via-price-stack"}
 
 
 @app.get("/")
 def root():
     return {"service": "equity-terminal-cloud",
             "endpoints": ["/api/health", "/api/candles", "/api/snapshot",
-                          "/api/fundamentals", "/api/news"]}
+                          "/api/fundamentals", "/api/news", "/api/analyst",
+                          "/api/benchmark"]}
