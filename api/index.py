@@ -431,31 +431,36 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
         try:
             yft = yf.Ticker(t)
             apt = yft.analyst_price_targets
-            # apt may be a dict or a pandas Series depending on yfinance version
+            # yfinance returns values as Yahoo raw dicts {"raw": 185.5, "fmt": "185.50"}
+            # or plain floats depending on version — handle both
+            def _extract(v):
+                if v is None:
+                    return None
+                if isinstance(v, dict):
+                    raw = v.get("raw")
+                    return round(float(raw), 2) if raw is not None else None
+                try:
+                    f = float(v)
+                    return round(f, 2) if f > 0 else None
+                except (TypeError, ValueError):
+                    return None
+
             if apt is not None:
-                # Normalise to plain dict
                 if hasattr(apt, 'to_dict'):
                     apt = apt.to_dict()
-                if isinstance(apt, dict):
-                    mean_val = apt.get("mean") or apt.get("Mean") or apt.get("targetMeanPrice")
-                    if mean_val and float(mean_val) > 0:
-                        def _f(k, *aliases):
-                            for key in (k,) + aliases:
-                                v = apt.get(key)
-                                if v is not None:
-                                    try: return round(float(v), 2)
-                                    except: pass
-                            return None
+                if isinstance(apt, dict) and apt:
+                    mean_val = _extract(apt.get("mean"))
+                    if mean_val and mean_val > 0:
                         price_target = {
-                            "high":    _f("high", "High", "targetHighPrice"),
-                            "low":     _f("low",  "Low",  "targetLowPrice"),
-                            "mean":    _f("mean", "Mean", "targetMeanPrice"),
-                            "median":  _f("median", "Median", "targetMedianPrice") or _f("mean"),
-                            "current": _f("current", "Current", "currentPrice"),
+                            "high":    _extract(apt.get("high")),
+                            "low":     _extract(apt.get("low")),
+                            "mean":    mean_val,
+                            "median":  _extract(apt.get("median")) or mean_val,
+                            "current": _extract(apt.get("current")),
                             "source":  "yahoo",
                         }
         except Exception as e:
-            notes.append(f"yfinance price targets unavailable: {str(e)[:80]}")
+            notes.append(f"yfinance price targets: {str(e)[:80]}")
 
     # --- yfinance analyst earnings estimates (free) ---
     if YFINANCE_OK and not analyst_estimates:
