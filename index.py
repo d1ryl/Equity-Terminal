@@ -20,6 +20,11 @@ import os
 import datetime as dt
 
 import requests
+try:
+    import yfinance as yf
+    YFINANCE_OK = True
+except ImportError:
+    YFINANCE_OK = False
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -421,56 +426,121 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
     else:
         notes.append("Set FINNHUB_KEY for analyst rating consensus.")
 
-    if FMP_API_KEY:
+    # --- yfinance price targets (free, no key, primary source) ---
+    if YFINANCE_OK and not price_target:
         try:
-            # v4/price-target returns individual analyst targets (free tier)
-            # We compute mean/median/high/low ourselves
-            url = (f"https://financialmodelingprep.com/api/v4/price-target"
-                   f"?symbol={t}&apikey={FMP_API_KEY}")
-            r = requests.get(url, timeout=20)
-            r.raise_for_status()
-            j = r.json()
-            targets = []
-            if isinstance(j, list):
-                # Take the most recent 30 analyst targets
-                for item in j[:30]:
-                    pt_val = item.get("priceTarget") or item.get("adjPriceTarget")
-                    if pt_val and float(pt_val) > 0:
-                        targets.append(float(pt_val))
-            if targets:
-                targets_sorted = sorted(targets)
-                n_t = len(targets_sorted)
-                median_t = targets_sorted[n_t // 2] if n_t % 2 else (targets_sorted[n_t//2-1] + targets_sorted[n_t//2]) / 2
+            yft = yf.Ticker(t)
+            apt = yft.analyst_price_targets
+            # apt is a dict: {current, low, mean, high, median (sometimes)}
+            if apt and apt.get("mean") and float(apt["mean"]) > 0:
                 price_target = {
-                    "high": max(targets_sorted),
-                    "low": min(targets_sorted),
-                    "mean": round(sum(targets_sorted) / n_t, 2),
-                    "median": round(median_t, 2),
-                    "count": n_t,
-                    "source": "fmp",
+                    "high":   round(float(apt.get("high",  0)), 2) or None,
+                    "low":    round(float(apt.get("low",   0)), 2) or None,
+                    "mean":   round(float(apt.get("mean",  0)), 2),
+                    "median": round(float(apt.get("median", apt.get("mean", 0))), 2),
+                    "current": round(float(apt.get("current", 0)), 2) or None,
+                    "source": "yahoo",
                 }
-            else:
-                # Fallback: try v3 consensus endpoint
-                url2 = (f"https://financialmodelingprep.com/api/v3/price-target-consensus"
-                        f"?symbol={t}&apikey={FMP_API_KEY}")
-                r2 = requests.get(url2, timeout=20)
-                if r2.status_code == 200:
-                    j2 = r2.json()
-                    row = j2[0] if isinstance(j2, list) and j2 else (j2 if isinstance(j2, dict) else None)
+        except Exception as e:
+            notes.append(f"yfinance price target fetch failed: {str(e)[:60]}")
+
+    # --- yfinance analyst earnings estimates (free) ---
+    if YFINANCE_OK and not analyst_estimates:
+        try:
+            yft2 = yf.Ticker(t)
+            try:
+                eps_est = yft2.earnings_estimate
+                rev_est = yft2.revenue_estimate
+                if eps_est is not None and not eps_est.empty:
+                    row_eps = eps_est.to_dict(orient="index").get("0y") or eps_est.to_dict(orient="index").get(list(eps_est.index)[0], {})
+                    row_rev = rev_est.to_dict(orient="index").get("0y") if rev_est is not None and not rev_est.empty else {}
+                    analyst_estimates = {
+                        "epsAvg":      row_eps.get("avg"),
+                        "epsHigh":     row_eps.get("high"),
+                        "epsLow":      row_eps.get("low"),
+                        "revenueAvg":  row_rev.get("avg") if row_rev else None,
+                        "revenueHigh": row_rev.get("high") if row_rev else None,
+                        "revenueLow":  row_rev.get("low") if row_rev else None,
+                        "source": "yahoo",
+                    }
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    if FMP_API_KEY:
+        # Try endpoints in order of preference; degrade gracefully on 403
+        pt_fetched = False
+
+        # 1. Try v4/price-target (requires Starter plan ~$19/mo)
+        if not pt_fetched:
+            try:
+                url = (f"https://financialmodelingprep.com/api/v4/price-target"
+                       f"?symbol={t}&apikey={FMP_API_KEY}")
+                r = requests.get(url, timeout=15)
+                if r.status_code == 200:
+                    items = r.json() if isinstance(r.json(), list) else []
+                    targets = [float(x["priceTarget"]) for x in items[:30]
+                               if x.get("priceTarget") and float(x.get("priceTarget", 0)) > 0]
+                    if targets:
+                        ts = sorted(targets)
+                        n_t = len(ts)
+                        med = ts[n_t // 2] if n_t % 2 else (ts[n_t//2-1] + ts[n_t//2]) / 2
+                        price_target = {
+                            "high": max(ts), "low": min(ts),
+                            "mean": round(sum(ts) / n_t, 2),
+                            "median": round(med, 2),
+                            "count": n_t, "source": "fmp-v4",
+                        }
+                        pt_fetched = True
+            except Exception:
+                pass
+
+        # 2. Try v3/price-target-consensus (requires Starter plan too, but try anyway)
+        if not pt_fetched:
+            try:
+                url = (f"https://financialmodelingprep.com/api/v3/price-target-consensus"
+                       f"?symbol={t}&apikey={FMP_API_KEY}")
+                r = requests.get(url, timeout=15)
+                if r.status_code == 200:
+                    j = r.json()
+                    row = j[0] if isinstance(j, list) and j else (j if isinstance(j, dict) else None)
                     if row and row.get("targetConsensus"):
                         price_target = {
-                            "high": row.get("targetHigh"),
-                            "low": row.get("targetLow"),
-                            "mean": row.get("targetConsensus"),
-                            "median": row.get("targetMedian"),
-                            "source": "fmp-consensus",
+                            "high": row.get("targetHigh"), "low": row.get("targetLow"),
+                            "mean": row.get("targetConsensus"), "median": row.get("targetMedian"),
+                            "source": "fmp-v3",
                         }
-                    else:
-                        notes.append("FMP returned no price targets for this ticker.")
-                else:
-                    notes.append("FMP price targets unavailable. Check FMP_API_KEY is active.")
-        except Exception as e:
-            notes.append(f"FMP price-target fetch failed: {str(e)[:80]}")
+                        pt_fetched = True
+            except Exception:
+                pass
+
+        # 3. Try v3/analyst-estimates for EPS/revenue consensus (free tier)
+        analyst_estimates = None
+        try:
+            url = (f"https://financialmodelingprep.com/api/v3/analyst-estimates"
+                   f"?symbol={t}&limit=2&apikey={FMP_API_KEY}")
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                est = r.json()
+                if isinstance(est, list) and est:
+                    analyst_estimates = {
+                        "revenueAvg": est[0].get("estimatedRevenueAvg"),
+                        "revenueHigh": est[0].get("estimatedRevenueHigh"),
+                        "revenueLow": est[0].get("estimatedRevenueLow"),
+                        "epsAvg": est[0].get("estimatedEpsAvg"),
+                        "date": est[0].get("date"),
+                    }
+        except Exception:
+            pass
+
+        if not pt_fetched:
+            notes.append(
+                "Price targets require FMP Starter plan (~$19/mo) at financialmodelingprep.com. "
+                "Your free key works for ratings/estimates but not price targets."
+            )
+        if analyst_estimates:
+            notes.append(f"__estimates__{__import__('json').dumps(analyst_estimates)}")
     elif FINNHUB_KEY:
         try:
             url = f"https://finnhub.io/api/v1/stock/price-target?symbol={t}&token={FINNHUB_KEY}"
@@ -507,8 +577,22 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
             "for analyst price targets."
         )
 
+    # Extract analyst estimates from notes (encoded as __estimates__<json>)
+    estimates_out = None
+    clean_notes = []
+    for n in notes:
+        if n.startswith("__estimates__"):
+            try:
+                import json as _json
+                estimates_out = _json.loads(n[len("__estimates__"):])
+            except Exception:
+                pass
+        else:
+            clean_notes.append(n)
+
     return {"ticker": t, "recommendation": recommendation,
-            "priceTarget": price_target, "notes": notes}
+            "priceTarget": price_target, "analystEstimates": estimates_out,
+            "notes": clean_notes}
 
 
 @app.get("/api/health")
