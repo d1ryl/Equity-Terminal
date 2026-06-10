@@ -274,6 +274,9 @@ def _net_debt(cik):
 
 
 def _latest_shares(cik):
+    # Prefer 10-K annual filings which report basic shares outstanding.
+    # Some filings include fully-diluted counts (options/warrants) which
+    # inflate the share count and suppress per-share DCF value.
     url = (f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}"
            "/dei/EntityCommonStockSharesOutstanding.json")
     r = requests.get(url, headers=SEC_HEADERS, timeout=20)
@@ -282,6 +285,11 @@ def _latest_shares(cik):
     units = r.json().get("units", {}).get("shares", [])
     if not units:
         return None
+    # Prefer 10-K annual filings (most stable, typically basic shares)
+    annual = [u for u in units if u.get("form") in ("10-K", "10-K/A") and u.get("end")]
+    if annual:
+        return float(max(annual, key=lambda u: u.get("end", ""))["val"])
+    # Fall back to most recent of any filing
     return float(max(units, key=lambda u: u.get("end", ""))["val"])
 
 
@@ -447,13 +455,25 @@ def analyst(code: str = Query(..., description="e.g. US.NVDA")):
                         "source": "finnhub",
                     }
                 else:
-                    notes.append("Price targets need FMP_API_KEY or a Finnhub plan that includes price targets.")
+                    notes.append(
+                        "Price targets need FMP_API_KEY (free tier: financialmodelingprep.com) "
+                        "or a Finnhub plan that includes price targets. "
+                        "Set FMP_API_KEY in the backend Vercel env to enable this."
+                    )
+            elif r.status_code == 403:
+                notes.append(
+                    "Price targets need FMP_API_KEY (free tier: financialmodelingprep.com) "
+                    "or a Finnhub Premium plan. Set FMP_API_KEY in backend Vercel env."
+                )
             else:
-                notes.append("Price targets need FMP_API_KEY or a Finnhub plan that includes price targets.")
-        except Exception:
-            notes.append("Price target fetch failed.")
+                notes.append("Price target fetch failed (HTTP " + str(r.status_code) + ").")
+        except Exception as e:
+            notes.append(f"Price target fetch failed: {e}")
     else:
-        notes.append("Set FMP_API_KEY for analyst price targets.")
+        notes.append(
+            "Set FMP_API_KEY (free tier: financialmodelingprep.com) in backend Vercel env "
+            "for analyst price targets."
+        )
 
     return {"ticker": t, "recommendation": recommendation,
             "priceTarget": price_target, "notes": notes}
